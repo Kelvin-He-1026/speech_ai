@@ -1,0 +1,19 @@
+# model weights / converted IRs (downloaded on demand by model_loader.py)
+models/
+
+# HuggingFace dataset + hub cache (downloaded on demand by speech_benchmark.py)
+data/hf_datasets/
+data/hf_home/
+
+# benchmark outputs (regeneratable; remove this line if you want to track them)
+output/
+
+# Python bytecode / venv noise
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
