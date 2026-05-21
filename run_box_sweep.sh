@@ -17,6 +17,13 @@ cd "$(dirname "$(readlink -f "$0")")"
 OUT_DIR=output/pytorch
 mkdir -p "$OUT_DIR"
 
+# Hide CUDA from this entire sweep — this box has H200s but no fabric-manager
+# init, so any cudaGetDeviceCount() probe (triggered eagerly by transformers /
+# torch on import) fails with "Error 802: system not yet initialized" even
+# though --device cpu never actually touches a GPU. Setting CUDA_VISIBLE_DEVICES
+# to empty makes torch report 0 GPUs cleanly and skip the probe entirely.
+export CUDA_VISIBLE_DEVICES=""
+
 MODEL=whisper-large-v3
 DTYPE=fp16
 DATASET=librispeech
@@ -69,16 +76,27 @@ run_sharded() {
     set -e
     echo "shard 0 exit $rc0,  shard 1 exit $rc1"
 
-    if [[ $rc0 -ne 0 && $rc0 -ne 134 ]]; then
-        echo "[FAIL] shard 0 failed for $label — see $log0" >&2
+    # Outcome-based success check. torch/numpy on CPU exit with various
+    # non-zero codes during interpreter teardown AFTER the CSV is on disk
+    # (134 SIGABRT from finalizer race, 139 SIGSEGV from C-ext teardown,
+    # -6 from PyGILState_Release in a daemon thread, etc.). Trusting exit
+    # code alone falsely flags those as failures. We instead check whether a
+    # fresh CSV for this shard appeared while we were waiting.
+    _shard_ok() {
+        local shard="$1"; local rc="$2"; local log_file="$3"
+        if [[ $rc -eq 0 ]]; then return 0; fi
+        local csv
+        csv=$(ls -t "$OUT_DIR"/*"_${DATASET}_"*"-shard${shard}of2_"*.csv 2>/dev/null | head -1)
+        if [[ -n "$csv" && "$csv" -nt "$log_file" ]]; then
+            echo "[ok] shard $shard exit $rc but CSV is newer than the log — treating as success"
+            echo "     csv: $csv"
+            return 0
+        fi
+        echo "[FAIL] shard $shard exit $rc and no fresh CSV — see $log_file" >&2
         return 1
-    fi
-    if [[ $rc1 -ne 0 && $rc1 -ne 134 ]]; then
-        echo "[FAIL] shard 1 failed for $label — see $log1" >&2
-        return 1
-    fi
-    # rc=134 (SIGABRT during finalizer teardown) is the known torch/CPU
-    # cleanup race — the CSV is already written by then.
+    }
+    _shard_ok 0 "$rc0" "$log0" || return 1
+    _shard_ok 1 "$rc1" "$log1" || return 1
 
     # aggregate_shards.py finds the newest matching shard set on its own.
     python aggregate_shards.py \

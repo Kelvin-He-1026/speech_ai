@@ -3,12 +3,29 @@ import csv
 import datetime as _dt
 import json
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+# Hide CUDA when the user explicitly asked for --device cpu. Must run BEFORE any
+# import of torch / transformers, because those probe cudaGetDeviceCount() at
+# import time and can crash with "Error 802: system not yet initialized" on a
+# multi-GPU box whose fabric manager isn't up — even when no CUDA code path
+# would actually run. argparse hasn't fired yet, so we sniff sys.argv directly.
+if "--device" in sys.argv:
+    try:
+        _dev_val = sys.argv[sys.argv.index("--device") + 1]
+        if _dev_val == "cpu":
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    except IndexError:
+        pass
+elif not any(a.startswith("--device") for a in sys.argv):
+    # No --device flag at all → defaults to cpu (the argparse default below).
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import numpy as np
 import psutil
