@@ -7,6 +7,7 @@ MODELS_DIR = Path(__file__).resolve().parent / "models"
 
 MODEL_REGISTRY = {
     "whisper-large-v3":          "openai/whisper-large-v3",
+    "whisper-large-v3-turbo":    "openai/whisper-large-v3-turbo",
     # Locally-quantized checkpoints produced by quantization.py
     # (no HF repo — must exist under models/ before use).
     "whisper-large-v3-w8a8":     "openai/whisper-large-v3-w8a8",
@@ -33,6 +34,13 @@ _COMMON_PATTERNS = [
 _TRANSFORMERS_PATTERNS = _COMMON_PATTERNS + ["*.safetensors", "*.safetensors.index.json"]
 _OPENVINO_PATTERNS = _COMMON_PATTERNS + ["*.xml", "*.bin"]
 
+# Weight files transformers / optimum will look for at load time.
+_TRANSFORMERS_WEIGHT_FILES = (
+    "model.safetensors", "model.safetensors.index.json",
+    "pytorch_model.bin", "pytorch_model.bin.index.json",
+)
+_OPENVINO_WEIGHT_FILES = ("openvino_model.xml",)
+
 
 def _is_openvino(repo_id: str) -> bool:
     return "-ov" in repo_id.lower() or "openvino" in repo_id.lower()
@@ -44,25 +52,41 @@ def _is_local_only(repo_id: str) -> bool:
     return any(tag in n for tag in ("-w8a8", "-w4a16", "-w4a4"))
 
 
+def _has_weights(target: Path, is_ov: bool) -> bool:
+    """True iff `target` already contains a usable weight file. Guards against
+    treating an interrupted snapshot_download (configs present, weights missing)
+    as a complete checkpoint."""
+    files = _OPENVINO_WEIGHT_FILES if is_ov else _TRANSFORMERS_WEIGHT_FILES
+    return any((target / f).exists() for f in files)
+
+
 def ensure_model(name: str) -> Path:
     repo_id = _resolve_repo_id(name)
     target = _local_path(repo_id)
-    if target.exists() and any(target.iterdir()):
+    is_ov = _is_openvino(repo_id)
+    if target.exists() and _has_weights(target, is_ov):
         return target
     if _is_local_only(repo_id):
         raise FileNotFoundError(
-            f"{target} does not exist. '{name}' is a locally-quantized "
-            f"checkpoint with no HF repo — produce it first, e.g.:\n"
-            f"  python quantization.py -o {target}"
+            f"{target} does not exist (or has no weights). '{name}' is a "
+            f"locally-quantized checkpoint with no HF repo — produce it first, "
+            f"e.g.:\n  python quantization.py -o {target}"
         )
     target.mkdir(parents=True, exist_ok=True)
-    patterns = _OPENVINO_PATTERNS if _is_openvino(repo_id) else _TRANSFORMERS_PATTERNS
+    patterns = _OPENVINO_PATTERNS if is_ov else _TRANSFORMERS_PATTERNS
+    print(f"[ensure_model] fetching {repo_id} -> {target}")
     snapshot_download(
         repo_id=repo_id,
         local_dir=str(target),
         local_dir_use_symlinks=False,
         allow_patterns=patterns,
     )
+    if not _has_weights(target, is_ov):
+        raise FileNotFoundError(
+            f"download of {repo_id} into {target} finished but no weight file "
+            f"(expected one of: {_OPENVINO_WEIGHT_FILES if is_ov else _TRANSFORMERS_WEIGHT_FILES}) "
+            f"is present. Check network/HF auth and re-run."
+        )
     return target
 
 

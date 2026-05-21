@@ -6,9 +6,9 @@
 # Hardware target: dual Xeon 8568Y+ (2 sockets × 48 physical cores). One process
 # per NUMA node, 48 OpenMP threads each — no HT siblings, no cross-socket UPI.
 #
-# Re-run safely: each pass tags its logs with a per-pass timestamp, and the
-# aggregator picks the NEWEST matching pair via `ls -t | head -1`, so old shard
-# CSVs in output/pytorch/ never get accidentally re-aggregated.
+# Re-run safely: each pass tags its logs with a per-pass timestamp; aggregate_shards.py
+# is given --model/--precision/--dataset/--mode and picks the newest matching
+# shard set on its own, so old shard CSVs in output/pytorch/ never get re-aggregated.
 
 set -eo pipefail
 
@@ -18,18 +18,18 @@ OUT_DIR=output/pytorch
 mkdir -p "$OUT_DIR"
 
 MODEL=whisper-large-v3
-DTYPE=bf16
+DTYPE=fp16
 DATASET=librispeech
 THREADS=48
 
 # Run one sharded pass (shard 0 on socket 0, shard 1 on socket 1), then aggregate.
 #   $1 = label   — short name used in log filenames and section header
-#   $2 = tag     — speech_benchmark.py's filename suffix for this mode
-#                  (e.g. offline-bAll, single-b1, batch-b48)
-#   $@ remaining — extra args forwarded to speech_benchmark.py
+#   $2 = mode    — single | batch | offline; forwarded to speech_benchmark.py as
+#                  --mode and used by aggregate_shards.py to locate the run
+#   $@ remaining — extra args forwarded to speech_benchmark.py (e.g. --batch-size)
 run_sharded() {
     local label="$1"; shift
-    local tag="$1";   shift
+    local mode="$1";  shift
     local extra=("$@")
 
     local stamp
@@ -45,7 +45,7 @@ run_sharded() {
     numactl --cpunodebind=0 --membind=0 \
         env OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
         python speech_benchmark.py --model "$MODEL" --dtype "$DTYPE" \
-            --datasets "$DATASET" "${extra[@]}" \
+            --datasets "$DATASET" --mode "$mode" "${extra[@]}" \
             --num-shards 2 --shard-idx 0 \
             > "$log0" 2>&1 &
     local pid0=$!
@@ -53,7 +53,7 @@ run_sharded() {
     numactl --cpunodebind=1 --membind=1 \
         env OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
         python speech_benchmark.py --model "$MODEL" --dtype "$DTYPE" \
-            --datasets "$DATASET" "${extra[@]}" \
+            --datasets "$DATASET" --mode "$mode" "${extra[@]}" \
             --num-shards 2 --shard-idx 1 \
             > "$log1" 2>&1 &
     local pid1=$!
@@ -80,28 +80,20 @@ run_sharded() {
     # rc=134 (SIGABRT during finalizer teardown) is the known torch/CPU
     # cleanup race — the CSV is already written by then.
 
-    # Pick up the newest shard CSV for this tag (the run we just did).
-    local shard0_csv shard1_csv
-    shard0_csv=$(ls -t "$OUT_DIR"/*"_${DATASET}_${tag}-shard0of2_"*.csv 2>/dev/null | head -1)
-    shard1_csv=$(ls -t "$OUT_DIR"/*"_${DATASET}_${tag}-shard1of2_"*.csv 2>/dev/null | head -1)
-    if [[ -z "$shard0_csv" || -z "$shard1_csv" ]]; then
-        echo "[FAIL] could not locate per-shard CSVs for tag '$tag'" >&2
-        return 1
-    fi
-    echo "aggregating:"
-    echo "  $shard0_csv"
-    echo "  $shard1_csv"
-
-    python aggregate_shards.py "$shard0_csv" "$shard1_csv" \
+    # aggregate_shards.py finds the newest matching shard set on its own.
+    python aggregate_shards.py \
+        --backend pytorch \
+        --model "$MODEL" --precision "$DTYPE" \
+        --dataset "$DATASET" --mode "$mode" \
         --write-csv "$OUT_DIR/box_summary.csv"
 }
 
 
 # === The sweep ===
 
-run_sharded "offline"  "offline-bAll" --mode offline
-run_sharded "single"   "single-b1"    --mode single
-run_sharded "batch48"  "batch-b48"    --mode batch --batch-size 48
+run_sharded "offline"  offline
+run_sharded "single"   single
+run_sharded "batch48"  batch  --batch-size 48
 
 
 echo

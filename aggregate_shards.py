@@ -12,16 +12,109 @@ speech_benchmark._write_combined_csv. This helper:
      shards have different word counts.
   5. Reports p50/p95 latency over the concatenated per-sample stream.
 
-Usage:
+Usage (explicit paths):
     python aggregate_shards.py output/pytorch/foo_shard0of2_*.csv \\
                               output/pytorch/foo_shard1of2_*.csv
+
+Usage (auto-lookup by model + precision; picks the latest matching shard set):
+    python aggregate_shards.py --model whisper-large-v3 --precision bf16 \\
+                              --mode offline --dataset librispeech
 """
 
 import argparse
 import csv
+import re
 import statistics
 import sys
+from collections import defaultdict
 from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_OUTPUT_ROOT = _HERE / "output"
+_BACKEND_DIRS = {
+    "pytorch":  _OUTPUT_ROOT / "pytorch",
+    "openvino": _OUTPUT_ROOT / "openvino",
+}
+
+# Filename written by speech_benchmark._csv_path:
+#   {model_slug}_{precision}_{dataset}_{mode_tag}_{YYYYMMDD_HHMM}.csv
+# where mode_tag for a sharded run looks like `offline-bAll-shard0of2`.
+# Anchor from the right because model_slug may contain '_' (e.g. `openai__whisper-large-v3`).
+_SHARD_RE = re.compile(
+    r"^(?P<model>.+)_(?P<precision>[^_]+)_(?P<dataset>[^_]+)_"
+    r"(?P<mode_tag>[^_]*-shard(?P<i>\d+)of(?P<n>\d+))_"
+    r"(?P<stamp>\d{8}_\d{4})\.csv$"
+)
+
+
+def find_shard_set(backend: str, model: str, precision: str,
+                   dataset: str | None = None, mode: str | None = None,
+                   stamp: str | None = None) -> list[Path]:
+    """Glob the backend output dir for sharded CSVs matching model + precision
+    (and optional dataset / mode / timestamp) and return one complete shard set.
+
+    If multiple runs match, pick the latest timestamp. Errors out if the set
+    is incomplete (e.g. shard1of2 missing) so the caller doesn't silently
+    average half a box.
+    """
+    if backend not in _BACKEND_DIRS:
+        raise SystemExit(f"unknown backend {backend!r}; expected one of {sorted(_BACKEND_DIRS)}")
+    out_dir = _BACKEND_DIRS[backend]
+    if not out_dir.is_dir():
+        raise SystemExit(f"backend dir does not exist: {out_dir}")
+
+    model_slug = model.replace("/", "__").replace(" ", "_")
+
+    # group_key -> {shard_index: [(stamp, path), ...]} (multiple historical runs)
+    # Stamp is intentionally NOT in the key: shards of the same run can finish
+    # in different minutes (speech_benchmark stamps each shard independently
+    # with HH:MM resolution), so grouping by stamp would split one run in two.
+    groups: dict[tuple, dict[int, list[tuple[str, Path]]]] = defaultdict(lambda: defaultdict(list))
+    for p in out_dir.iterdir():
+        if not p.is_file() or not p.name.endswith(".csv"):
+            continue
+        m = _SHARD_RE.match(p.name)
+        if not m:
+            continue
+        if m["model"] != model_slug or m["precision"] != precision:
+            continue
+        if dataset and m["dataset"] != dataset:
+            continue
+        if mode and not m["mode_tag"].startswith(mode + "-"):
+            continue
+        if stamp and m["stamp"] != stamp:
+            continue
+        n = int(m["n"])
+        base_mode_tag = m["mode_tag"][:m["mode_tag"].rindex("-shard")]
+        key = (m["dataset"], base_mode_tag, n)
+        groups[key][int(m["i"])].append((m["stamp"], p))
+
+    if not groups:
+        filters = [f"model={model_slug}", f"precision={precision}"]
+        if dataset: filters.append(f"dataset={dataset}")
+        if mode:    filters.append(f"mode={mode}")
+        if stamp:   filters.append(f"stamp={stamp}")
+        raise SystemExit(f"no sharded CSVs in {out_dir} matching: {', '.join(filters)}")
+
+    # Pick the group whose latest-overall shard is most recent.
+    def _group_latest_stamp(g: dict[int, list[tuple[str, Path]]]) -> str:
+        return max(s for entries in g.values() for s, _ in entries)
+    best_key = max(groups, key=lambda k: _group_latest_stamp(groups[k]))
+    by_index = groups[best_key]
+    _ds, _base_mode, n = best_key
+
+    missing = [i for i in range(n) if i not in by_index]
+    if missing:
+        raise SystemExit(
+            f"incomplete shard set for {best_key}: have {sorted(by_index)}, missing {missing}"
+        )
+    # For each shard index, take the latest stamp — this is the most recent run.
+    picked = {i: max(by_index[i], key=lambda sp: sp[0]) for i in range(n)}
+    stamps = sorted({s for s, _ in picked.values()})
+    if len(groups) > 1 or any(len(by_index[i]) > 1 for i in range(n)):
+        print(f"[info] picking latest shards for {best_key[0]}/{best_key[1]} "
+              f"(stamps: {', '.join(stamps)})")
+    return [picked[i][1] for i in range(n)]
 
 
 def parse_combined_csv(path: Path) -> tuple[dict, list[dict]]:
@@ -214,13 +307,40 @@ def _print_box_report(r: dict) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("paths", nargs="+",
-                   help="Two-or-more per-shard combined CSVs (the files speech_benchmark.py writes).")
+    p.add_argument("paths", nargs="*",
+                   help="Two-or-more per-shard combined CSVs. Omit and use --model/--precision "
+                        "to auto-discover the latest matching shard set instead.")
+    p.add_argument("--model", default=None,
+                   help="Model name as passed to speech_benchmark (e.g. 'whisper-large-v3' "
+                        "or 'openai/whisper-large-v3'). Used to auto-locate shard CSVs.")
+    p.add_argument("--precision", default=None,
+                   help="Precision tag in the filename (e.g. bf16, fp16, int8, w8a8).")
+    p.add_argument("--backend", default="pytorch", choices=sorted(_BACKEND_DIRS),
+                   help="Which output/{backend}/ directory to scan when auto-locating.")
+    p.add_argument("--dataset", default=None,
+                   help="Optional dataset filter (e.g. librispeech, tedlium).")
+    p.add_argument("--mode", default=None, choices=("single", "batch", "offline"),
+                   help="Optional mode filter.")
+    p.add_argument("--stamp", default=None,
+                   help="Optional exact timestamp filter (YYYYMMDD_HHMM). "
+                        "Default: pick the latest matching set.")
     p.add_argument("--write-csv", default=None,
                    help="Optional path to also write the box-level summary as a 1-row CSV.")
     args = p.parse_args()
 
-    paths = [Path(x) for x in args.paths]
+    if args.paths:
+        paths = [Path(x) for x in args.paths]
+    elif args.model and args.precision:
+        paths = find_shard_set(
+            backend=args.backend, model=args.model, precision=args.precision,
+            dataset=args.dataset, mode=args.mode, stamp=args.stamp,
+        )
+        print(f"[auto] using {len(paths)} shard(s) from output/{args.backend}/:")
+        for x in paths:
+            print(f"  {x.name}")
+    else:
+        p.error("provide either positional shard paths or --model and --precision")
+
     missing = [x for x in paths if not x.exists()]
     if missing:
         print("Files not found:", *missing, sep="\n  ", file=sys.stderr)
