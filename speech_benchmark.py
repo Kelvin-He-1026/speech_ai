@@ -8,21 +8,72 @@ import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import psutil
 
 _HERE = Path(__file__).resolve().parent
 DATA_DIR = _HERE / "data"
-OUTPUT_DIR = _HERE / "output"
+OUTPUT_ROOT = _HERE / "output"
+PYTORCH_OUT = OUTPUT_ROOT / "pytorch"
+OPENVINO_OUT = OUTPUT_ROOT / "openvino"
 HF_CACHE_DIR = DATA_DIR / "hf_datasets"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PYTORCH_OUT.mkdir(parents=True, exist_ok=True)
+OPENVINO_OUT.mkdir(parents=True, exist_ok=True)
 HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 os.environ.setdefault("HF_DATASETS_CACHE", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HOME", str(DATA_DIR / "hf_home"))
+
+EAST = ZoneInfo("America/New_York")  # matches vllm_speech_benchmark.py
+
+
+# Silence "Both `max_new_tokens` (=440) and `max_length`(=20) seem to have been set."
+# from transformers.generation.utils._prepare_generated_length. We own length-control
+# on the gen_config in _run_one_dataset (max_length=None, max_new_tokens=440) and do
+# not pass max_new_tokens as a generate() kwarg, which removes the underlying conflict.
+# The filter is the belt-and-suspenders: Whisper long-form internally calls
+# super().generate() per 30-s segment with a freshly-built GenerationConfig() that can
+# re-introduce the default max_length=20, re-firing the warning. Filter is installed at
+# module-import time so it covers every code path that imports this script — including
+# the warmup generate(), batched offline call, and any sub-process spawned for sharding.
+import logging as _logging  # noqa: E402
+class _MaxLengthWarnFilter(_logging.Filter):  # noqa: E302
+    def filter(self, record):
+        return "Both `max_new_tokens`" not in record.getMessage()
+for _name in ("transformers", "transformers.generation", "transformers.generation.utils"):
+    _logging.getLogger(_name).addFilter(_MaxLengthWarnFilter())
+
+_DTYPE_TO_TAG = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "auto": "auto",
+}
+
+
+def _infer_precision_from_name(name: str) -> Optional[str]:
+    n = name.lower()
+    for tag in ("w8a8", "int8", "int4", "fp16", "bf16", "fp32"):
+        if tag in n:
+            return tag
+    return None
+
+
+def _dtype_arg_to_tag(dtype: Optional[str]) -> Optional[str]:
+    if not dtype:
+        return None
+    return _DTYPE_TO_TAG.get(dtype, dtype)
+
+
+def _torch_dtype_to_tag(model_dtype) -> Optional[str]:
+    if model_dtype is None:
+        return None
+    s = str(model_dtype).replace("torch.", "")
+    return _DTYPE_TO_TAG.get(s, s)
 
 try:
     from .model_loader import MODEL_REGISTRY, load_model
@@ -37,6 +88,7 @@ class SampleResult:
     total_seconds: float
     ttft_seconds: float
     n_new_tokens: int
+    tpot_seconds: float = 0.0
     wer: float = 0.0
     n_ref_words: int = 0
     substitutions: int = 0
@@ -53,6 +105,8 @@ class BenchReport:
     timestamp: str
     model: str
     dataset: str
+    mode: str
+    batch_size: int
     device: str
     resolved_device: str
     dtype: str
@@ -60,6 +114,8 @@ class BenchReport:
     total_audio_s: float
     total_wall_s: float
     throughput_xrt: float
+    total_new_tokens: int
+    tok_per_s: float
     avg_ttft_ms: float
     p50_ttft_ms: float
     p95_ttft_ms: float
@@ -101,32 +157,71 @@ class MemoryMonitor:
 
 
 def _make_streamer():
+    """Counts decode steps and records TTFT (works for batched generate too).
+
+    For single-stream generate, `n_steps` equals tokens emitted for that one
+    sequence. For batched generate, `n_steps` is the number of decode steps
+    (= max tokens across the batch); per-sample token counts come from the
+    final output tensor.
+    """
     from transformers.generation.streamers import BaseStreamer
 
     class TimingStreamer(BaseStreamer):
         def __init__(self):
             self.first_token_time: Optional[float] = None
-            self.n_new_tokens: int = 0
+            self.n_steps: int = 0
             self.start: float = 0.0
 
         def begin(self, t0: float):
             self.start = t0
             self.first_token_time = None
-            self.n_new_tokens = 0
+            self.n_steps = 0
 
         def put(self, value):
             if self.first_token_time is None:
                 self.first_token_time = time.perf_counter() - self.start
-            try:
-                n = int(value.shape[-1]) if value.ndim >= 1 else 1
-            except (AttributeError, IndexError):
-                n = 1
-            self.n_new_tokens += n
+            self.n_steps += 1
 
         def end(self):
             pass
 
     return TimingStreamer()
+
+
+def _chunk_iter(iterable, n: Optional[int]):
+    """Yield lists of up to `n` items. n=None → one chunk containing everything."""
+    if n is None:
+        yield list(iterable)
+        return
+    chunk = []
+    for item in iterable:
+        chunk.append(item)
+        if len(chunk) >= n:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+_WHISPER_PROMPT_LEN = 4  # SOT + lang + task + <|notimestamps|>
+
+
+def _per_sample_new_tokens(out, prompt_len: int, pad_or_eos_id) -> list[int]:
+    """For batched generate, count tokens generated per sample (excluding the
+    forced decoder prompt and any trailing pad/eos repetition)."""
+    counts = []
+    for row in out:
+        gen = row[prompt_len:]
+        if pad_or_eos_id is not None:
+            mask = (gen != pad_or_eos_id)
+            n = int(mask.sum().item())
+            # If the sequence ended with EOS, include that one EOS token
+            if n < gen.size(0):
+                n += 1
+        else:
+            n = int(gen.size(0))
+        counts.append(max(1, n))
+    return counts
 
 
 def _resample(audio: np.ndarray, sr: int, target_sr: int = 16000) -> np.ndarray:
@@ -230,7 +325,7 @@ def _iter_chime6(manifest_path: str, max_samples: Optional[int] = None):
 DATASET_LOADERS = {
     "librispeech": _iter_librispeech,
     "tedlium": _iter_tedlium,
-    "chime6": _iter_chime6,
+    # "chime6": _iter_chime6,
 }
 
 
@@ -264,8 +359,8 @@ def _run_one_dataset(
     model_name: str, device: str, resolved_device: str,
     is_ov: bool, torch, torch_device, model_dtype,
     dtype_arg: Optional[str], language: str,
-    samples_csv_path: Optional[Path] = None,
-) -> BenchReport:
+    mode: str = "single", batch_size: int = 1,
+) -> tuple[BenchReport, list]:
     import jiwer
     from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
 
@@ -275,28 +370,97 @@ def _run_one_dataset(
     gen_kwargs = dict(
         language=language,
         task="transcribe",
-        max_new_tokens=440,
         return_timestamps=False,
     )
 
+    # Length control: own it on the gen_config side, with NO max_new_tokens in
+    # kwargs. transformers warns "Both `max_new_tokens` and `max_length` seem to
+    # have been set" when both paths supply a value; setting max_length=None and
+    # max_new_tokens on the gen_config eliminates the conflict. The accompanying
+    # logger filter is installed at module-import time (see top of file).
+    gc = getattr(model, "generation_config", None)
+    if gc is not None:
+        gc.max_length = None
+        gc.max_new_tokens = 440
+
     if not is_ov and torch_device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+
+    if mode == "single":
+        chunk_size = 1
+    elif mode == "batch":
+        chunk_size = max(1, batch_size)
+    elif mode == "offline":
+        chunk_size = None  # one big chunk = all samples
+    else:
+        raise ValueError(f"unknown mode: {mode}")
+
+    pad_id = getattr(model.generation_config, "pad_token_id", None)
+    if pad_id is None:
+        eos = getattr(model.generation_config, "eos_token_id", None)
+        pad_id = eos[0] if isinstance(eos, list) else eos
 
     streamer = _make_streamer()
     results: list[SampleResult] = []
     total_audio_s = 0.0
     total_wall_s = 0.0
 
+    # One-shot warmup with silence so kernel JIT/autotune, allocator growth,
+    # attention backend selection, and tokenizer/normalizer first-touch don't
+    # get charged to the first timed chunk (which otherwise looks ~10x slower
+    # than steady state). Sized to chunk_size so batched kernels autotune at
+    # the right shape; offline mode falls back to 1.
+    warmup_n = chunk_size if chunk_size is not None else 1
+    warmup_audios = [np.zeros(16000, dtype=np.float32) for _ in range(warmup_n)]
+    warmup_inputs = processor(
+        warmup_audios, sampling_rate=16000, return_tensors="pt",
+        return_attention_mask=True,
+    )
+    warmup_features = warmup_inputs.input_features
+    warmup_mask = warmup_inputs.get("attention_mask")
+    if not is_ov:
+        warmup_features = warmup_features.to(torch_device)
+        if model_dtype is not None and warmup_features.dtype != model_dtype:
+            warmup_features = warmup_features.to(model_dtype)
+        if warmup_mask is not None:
+            warmup_mask = warmup_mask.to(torch_device)
+    warmup_kwargs = dict(gen_kwargs)
+    if warmup_mask is not None:
+        warmup_kwargs["attention_mask"] = warmup_mask
+    print(f"[warmup] running 1 untimed generate() at batch={warmup_n}")
+    with torch.inference_mode():
+        _ = model.generate(input_features=warmup_features, **warmup_kwargs)
+    if not is_ov and torch_device.type == "cuda":
+        torch.cuda.synchronize()
+
     with MemoryMonitor() as mon:
-        for sample_id, audio, sr, ref in sample_iter:
-            audio_seconds = len(audio) / float(sr)
-            audio = _resample(audio, sr, 16000)
-            inputs = processor(audio, sampling_rate=16000, return_tensors="pt")
+        for chunk in _chunk_iter(sample_iter, chunk_size):
+            ids = [c[0] for c in chunk]
+            audios = [_resample(c[1], c[2], 16000) for c in chunk]
+            refs = [c[3] for c in chunk]
+            audio_seconds_each = [len(a) / 16000.0 for a in audios]
+
+            # Single-element list still produces a [1, ...] batched tensor.
+            # return_attention_mask=True makes the feature extractor emit a mask
+            # over the (zero-padded) mel frames — required to silence the
+            # "pad_token == eos_token, attention mask not set" warning during
+            # decoder generation and to get reliable batched results.
+            inputs = processor(
+                audios, sampling_rate=16000, return_tensors="pt",
+                return_attention_mask=True,
+            )
             input_features = inputs.input_features
+            attention_mask = inputs.get("attention_mask")
             if not is_ov:
                 input_features = input_features.to(torch_device)
                 if model_dtype is not None and input_features.dtype != model_dtype:
                     input_features = input_features.to(model_dtype)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(torch_device)
+
+            gen_call_kwargs = dict(gen_kwargs)
+            if attention_mask is not None:
+                gen_call_kwargs["attention_mask"] = attention_mask
 
             t0 = time.perf_counter()
             streamer.begin(t0)
@@ -304,26 +468,40 @@ def _run_one_dataset(
                 out = model.generate(
                     input_features=input_features,
                     streamer=streamer,
-                    **gen_kwargs,
+                    **gen_call_kwargs,
                 )
             if not is_ov and torch_device.type == "cuda":
                 torch.cuda.synchronize()
             total = time.perf_counter() - t0
 
-            hyp = processor.batch_decode(out, skip_special_tokens=True)[0]
-            results.append(SampleResult(
-                sample_id=sample_id,
-                audio_seconds=audio_seconds,
-                total_seconds=total,
-                ttft_seconds=streamer.first_token_time or total,
-                n_new_tokens=streamer.n_new_tokens,
-                reference=ref,
-                hypothesis=hyp,
-            ))
-            total_audio_s += audio_seconds
+            hyps = processor.batch_decode(out, skip_special_tokens=True)
+            if out.dim() == 2 and out.size(0) > 1:
+                per_sample_tokens = _per_sample_new_tokens(out, _WHISPER_PROMPT_LEN, pad_id)
+            else:
+                per_sample_tokens = [streamer.n_steps]
+
+            ttft = streamer.first_token_time if streamer.first_token_time is not None else total
+            for i, sid in enumerate(ids):
+                results.append(SampleResult(
+                    sample_id=sid,
+                    audio_seconds=audio_seconds_each[i],
+                    total_seconds=total,  # chunk wall — shared across batch
+                    ttft_seconds=ttft,    # shared across batch
+                    n_new_tokens=per_sample_tokens[i] if i < len(per_sample_tokens) else streamer.n_steps,
+                    reference=refs[i],
+                    hypothesis=hyps[i],
+                ))
+                total_audio_s += audio_seconds_each[i]
             total_wall_s += total
 
     for r in results:
+        # Same formula used for the avg_tpot_ms aggregate. In batch mode the
+        # numerator is shared across the chunk, so per-sample TPOT mainly
+        # varies with how many tokens each sample actually emitted.
+        r.tpot_seconds = (
+            (r.total_seconds - r.ttft_seconds) / (r.n_new_tokens - 1)
+            if r.n_new_tokens > 1 else 0.0
+        )
         r.reference_normalized = normalizer(r.reference)
         r.hypothesis_normalized = normalizer(r.hypothesis)
         ref_n = r.reference_normalized or "<empty>"
@@ -338,8 +516,6 @@ def _run_one_dataset(
     hyps_norm = [r.hypothesis_normalized or "<empty>" for r in results]
     wo = jiwer.process_words(refs_norm, hyps_norm)
 
-    if samples_csv_path is not None:
-        _write_samples_csv(results, samples_csv_path)
     total_ref_words = wo.hits + wo.substitutions + wo.deletions
     denom = max(1, total_ref_words)
 
@@ -359,10 +535,12 @@ def _run_one_dataset(
         else (dtype_arg or "ov-native")
     )
 
-    return BenchReport(
+    report = BenchReport(
         timestamp=_dt.datetime.now().isoformat(timespec="seconds"),
         model=model_name,
         dataset=dataset,
+        mode=mode,
+        batch_size=batch_size,
         device=device,
         resolved_device=resolved_device,
         dtype=effective_dtype,
@@ -370,6 +548,8 @@ def _run_one_dataset(
         total_audio_s=total_audio_s,
         total_wall_s=total_wall_s,
         throughput_xrt=total_audio_s / max(1e-9, total_wall_s),
+        total_new_tokens=sum(r.n_new_tokens for r in results),
+        tok_per_s=sum(r.n_new_tokens for r in results) / max(1e-9, total_wall_s),
         avg_ttft_ms=float(ttfts.mean() * 1000),
         p50_ttft_ms=float(np.percentile(ttfts, 50) * 1000),
         p95_ttft_ms=float(np.percentile(ttfts, 95) * 1000),
@@ -381,6 +561,7 @@ def _run_one_dataset(
         peak_rss_mb=mon.peak_rss / (1024 ** 2),
         peak_cuda_mb=peak_cuda_mb,
     )
+    return report, results
 
 
 def benchmark_model(
@@ -396,7 +577,12 @@ def benchmark_model(
     tedlium_split: str = "test",
     streaming: bool = True,
     language: str = "english",
+    mode: str = "single",
+    batch_size: int = 1,
+    sort_by_length: bool = False,
     output_csv: Optional[str] = None,
+    num_shards: int = 1,
+    shard_idx: int = 0,
 ) -> list:
     if device == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -417,7 +603,38 @@ def benchmark_model(
         torch_device = next(model.parameters()).device
         model_dtype = next(model.parameters()).dtype
 
-    date = _dt.date.today().strftime("%Y%m%d")
+    # mode_tag stays a single underscore-free token so consolidate_outputs.py's
+    # rpartition('_') parser keeps working. Hyphens are used to compose multi-part
+    # tags. Batch size is shown explicitly for every mode:
+    #   single        → single-b1            (one sample per generate)
+    #   batch  -B=N   → batch-bN             (N samples per generate)
+    #   offline       → offline-bAll         (all samples in one generate call)
+    if mode == "batch":
+        mode_tag = f"batch-b{batch_size}"
+    elif mode == "single":
+        mode_tag = "single-b1"
+    elif mode == "offline":
+        mode_tag = "offline-bAll"
+    else:
+        mode_tag = mode
+    if sort_by_length:
+        mode_tag += "-sorted"
+    if num_shards > 1:
+        mode_tag += f"-shard{shard_idx}of{num_shards}"
+    if mode == "batch":
+        print(f"[mode] batch with batch_size={batch_size} "
+              f"→ output tag '{mode_tag}'")
+    if num_shards > 1:
+        print(f"[shard] this process handles every {num_shards}th sample starting at index {shard_idx} "
+              f"→ output tag '{mode_tag}'")
+    precision = (
+        _infer_precision_from_name(model_name)
+        or _dtype_arg_to_tag(dtype)
+        or _torch_dtype_to_tag(model_dtype)
+        or "ov-native"
+    )
+    out_dir = _output_dir_for(is_ov)
+
     reports: list[BenchReport] = []
     for ds in datasets:
         if ds == "chime6":
@@ -432,23 +649,57 @@ def benchmark_model(
         else:
             raise ValueError(f"unknown dataset: {ds}")
 
-        samples_path = OUTPUT_DIR / f"{_slug(model_name)}_{ds}_{date}.csv"
-        print(f"\n=== running {model_name} on {ds} ===")
-        report = _run_one_dataset(
+        if num_shards > 1:
+            # Modulo shard on the GLOBAL stream index. Each shard sees every Nth
+            # sample; the union of all shards equals the full split. In streaming
+            # mode this still pulls every row over the wire and discards 1-of-N
+            # — wasted bandwidth but trivial vs compute. Sharding happens before
+            # sort_by_length so each shard sorts only its own subset.
+            def _shard(it, ns=num_shards, si=shard_idx):
+                for i, ex in enumerate(it):
+                    if i % ns == si:
+                        yield ex
+            sample_iter = _shard(sample_iter)
+
+        if sort_by_length:
+            # Materialize the stream and sort by ascending audio duration so
+            # each batch holds similarly-sized clips, reducing the "short waits
+            # on long" waste in batched generate(). Cost: keeps the decoded
+            # waveforms in memory (LibriSpeech test.clean ~75 MB).
+            sample_iter = sorted(sample_iter, key=lambda s: len(s[1]) / max(1, s[2]))
+            durs = [len(s[1]) / max(1, s[2]) for s in sample_iter]
+            print(f"[sort] {len(sample_iter)} samples by ascending duration "
+                  f"(min={min(durs):.2f}s, max={max(durs):.2f}s)")
+
+        print(f"\n=== {_slug(model_name)} | {precision} | {ds} | {mode_tag} ===")
+        report, samples = _run_one_dataset(
             model=model, processor=processor,
             dataset=ds, sample_iter=sample_iter,
             model_name=model_name, device=device, resolved_device=resolved_device,
             is_ov=is_ov, torch=torch, torch_device=torch_device, model_dtype=model_dtype,
             dtype_arg=dtype, language=language,
-            samples_csv_path=samples_path,
+            mode=mode, batch_size=batch_size,
         )
         _print_report(report)
-        print(f"per-sample CSV: {samples_path}")
+
+        stamp = _dt.datetime.now(EAST).strftime("%Y%m%d_%H%M")
+        out_path = (Path(output_csv) if output_csv
+                    else _csv_path(out_dir, model_name, precision, ds, mode_tag, stamp))
+        _write_combined_csv(report, samples, out_path)
+        print(f"wrote {out_path}")
         reports.append(report)
 
-    csv_path = Path(output_csv) if output_csv else _default_csv_path(model_name, date)
-    _write_csv(reports, csv_path)
-    print(f"\nsummary CSV: {csv_path}")
+        # Also append a one-row entry to output/{backend}/box_summary.csv for
+        # mode in {single, batch} non-sharded runs. Sharded runs are aggregated
+        # via aggregate_shards.py; offline runs are excluded by request — their
+        # per-sample latency stats are meaningless (one giant call shares wall
+        # time across the whole batch) and they distort the cross-run table.
+        if mode in ("single", "batch") and num_shards == 1:
+            _append_box_summary_row(
+                out_dir / "box_summary.csv",
+                _box_row_from_report(report, samples, batch_size),
+            )
+
     return reports
 
 
@@ -456,41 +707,121 @@ def _slug(s: str) -> str:
     return s.replace("/", "__").replace(" ", "_")
 
 
-def _default_csv_path(model_name: str, date: Optional[str] = None) -> Path:
-    date = date or _dt.date.today().strftime("%Y%m%d")
-    return OUTPUT_DIR / f"{_slug(model_name)}_{date}.csv"
+def _output_dir_for(is_ov: bool) -> Path:
+    """PyTorch runs → output/pytorch/, OpenVINO runs → output/openvino/."""
+    return OPENVINO_OUT if is_ov else PYTORCH_OUT
 
 
-def _write_csv(reports: list, path: Path) -> None:
+def _csv_path(out_dir: Path, model_name: str, precision: str,
+              dataset: str, mode_tag: str, stamp: str) -> Path:
+    """Match vllm_speech_benchmark.py naming:
+        {model}_{precision}_{dataset}_{mode_tag}_{YYYYMMDD_HHMM}.csv"""
+    return out_dir / f"{_slug(model_name)}_{precision}_{dataset}_{mode_tag}_{stamp}.csv"
+
+
+def _write_combined_csv(report: BenchReport, samples: list, path: Path) -> None:
+    """One CSV per (model, precision, dataset, mode): summary block on top,
+    per-sample rows below. Same layout as the vLLM benchmark output."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = [f.name for f in fields(BenchReport)]
+    summary_fields = [f.name for f in fields(BenchReport)]
+    sample_fields = [f.name for f in fields(SampleResult)]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(header)
-        for r in reports:
-            w.writerow([getattr(r, h) for h in header])
+        w.writerow(["# summary"])
+        w.writerow(summary_fields)
+        w.writerow([getattr(report, h) for h in summary_fields])
+        w.writerow([])
+        w.writerow(["# per-sample"])
+        w.writerow(sample_fields)
+        for r in samples:
+            w.writerow([getattr(r, h) for h in sample_fields])
 
 
-def _write_samples_csv(results: list, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = [f.name for f in fields(SampleResult)]
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for r in results:
-            w.writerow([getattr(r, h) for h in header])
+# Field order is locked to aggregate_shards.py so single/batch runs and sharded
+# runs share one box_summary.csv schema. Keep these two lists in sync.
+_BOX_SUMMARY_FIELDS = [
+    "model", "dtype", "dataset", "base_mode", "batch_size", "n_shards",
+    "n_samples", "total_audio_s", "max_wall_s", "box_xrt", "box_tok_per_s",
+    "wer", "ref_words", "substitutions", "deletions", "insertions",
+    "p50_total_ms", "p95_total_ms", "p50_ttft_ms", "p95_ttft_ms",
+]
+
+
+def _percentile(xs, p):
+    if not xs:
+        return 0.0
+    xs_sorted = sorted(xs)
+    idx = max(0, min(len(xs_sorted) - 1, int(p * len(xs_sorted)) - 1))
+    return xs_sorted[idx]
+
+
+def _box_row_from_report(report: BenchReport, samples: list, batch_size: int) -> dict:
+    """Build a one-row dict for box_summary.csv from a single non-sharded run."""
+    import statistics
+    totals = [s.total_seconds for s in samples if s.total_seconds > 0]
+    ttfts  = [s.ttft_seconds  for s in samples if s.ttft_seconds  > 0]
+    p50_total = statistics.median(totals) if totals else 0.0
+    p95_total = _percentile(totals, 0.95)
+    p50_ttft  = statistics.median(ttfts)  if ttfts  else 0.0
+    p95_ttft  = _percentile(ttfts, 0.95)
+
+    if report.mode == "single":
+        batch_size_eff = "1"
+    elif report.mode == "batch":
+        batch_size_eff = str(batch_size)
+    else:  # offline path is excluded at the call site, but stay safe
+        batch_size_eff = "all"
+
+    return {
+        "model":          report.model,
+        "dtype":          report.dtype,
+        "dataset":        report.dataset,
+        "base_mode":      report.mode,
+        "batch_size":     batch_size_eff,
+        "n_shards":       1,
+        "n_samples":      report.n_samples,
+        "total_audio_s":  round(report.total_audio_s, 3),
+        "max_wall_s":     round(report.total_wall_s, 3),
+        "box_xrt":        round(report.throughput_xrt, 4),
+        "box_tok_per_s":  round(report.tok_per_s, 3),
+        "wer":            round(report.wer, 6),
+        "ref_words":      sum(s.n_ref_words   for s in samples),
+        "substitutions":  sum(s.substitutions for s in samples),
+        "deletions":      sum(s.deletions     for s in samples),
+        "insertions":     sum(s.insertions    for s in samples),
+        "p50_total_ms":   round(p50_total * 1000, 2),
+        "p95_total_ms":   round(p95_total * 1000, 2),
+        "p50_ttft_ms":    round(p50_ttft  * 1000, 2),
+        "p95_ttft_ms":    round(p95_ttft  * 1000, 2),
+    }
+
+
+def _append_box_summary_row(box_csv: Path, row: dict) -> None:
+    """Append one row, writing the header on first use. Field set is fixed to
+    _BOX_SUMMARY_FIELDS (the same as aggregate_shards.py) so both code paths
+    produce a consistent file."""
+    box_csv.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not box_csv.exists() or box_csv.stat().st_size == 0
+    with box_csv.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_BOX_SUMMARY_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
 
 
 def _print_report(r: BenchReport) -> None:
     rows = [
         ("model", r.model),
         ("dataset", r.dataset),
+        ("mode", f"{r.mode} (batch_size={r.batch_size})" if r.mode == "batch" else r.mode),
         ("device", f"{r.device} ({r.resolved_device})"),
         ("dtype", r.dtype),
         ("samples", str(r.n_samples)),
         ("audio (s)", f"{r.total_audio_s:.1f}"),
         ("wall (s)", f"{r.total_wall_s:.1f}"),
         ("throughput (xRT)", f"{r.throughput_xrt:.2f}"),
+        ("generated tokens", str(r.total_new_tokens)),
+        ("throughput (tok/s)", f"{r.tok_per_s:.2f}"),
         ("WER", f"{r.wer * 100:.2f}%"),
         ("substitution rate", f"{r.sub_rate * 100:.2f}%"),
         ("deletion rate", f"{r.del_rate * 100:.2f}%"),
@@ -527,9 +858,37 @@ def main():
     p.add_argument("--no-streaming", action="store_true",
                    help="Download datasets fully into data/ instead of streaming")
     p.add_argument("--language", default="english")
+    p.add_argument("--mode", default="single",
+                   choices=["single", "batch", "offline"],
+                   help="single = 1 audio at a time through generate (default); "
+                        "batch  = --batch-size audios per fused generate call; "
+                        "offline = stack ALL samples into one generate call "
+                        "(can OOM — use with --max-samples).")
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="Audios per fused generate call when --mode batch (default: 8)")
+    p.add_argument("--sort-by-length", action="store_true",
+                   help="Materialize the dataset and sort by ascending audio "
+                        "duration before batching so each batch holds "
+                        "similarly-sized clips (reduces 'short waits on long' "
+                        "waste in batch mode). Tag '_sorted' is appended to "
+                        "the output filename.")
     p.add_argument("--output-csv", default=None,
-                   help="CSV path (default: output/{model}_{YYYYMMDD}.csv, overwritten)")
+                   help="Override CSV path for ALL datasets (default per-dataset: "
+                        "output/{pytorch|openvino}/"
+                        "{model}_{precision}_{dataset}_{mode_tag}_{YYYYMMDD_HHMM}.csv)")
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="Total number of shards. Pair with --shard-idx and launch one "
+                        "process per socket under numactl to scale throughput across NUMA "
+                        "nodes. Each shard takes every Nth sample. After both finish, "
+                        "use aggregate_shards.py to compute box-level metrics.")
+    p.add_argument("--shard-idx", type=int, default=0,
+                   help="This process's shard index in [0, num_shards). Ignored when num-shards=1.")
     args = p.parse_args()
+
+    if args.num_shards < 1 or not (0 <= args.shard_idx < args.num_shards):
+        raise SystemExit(
+            f"--shard-idx ({args.shard_idx}) must be in [0, --num-shards={args.num_shards})"
+        )
 
     benchmark_model(
         args.model,
@@ -543,7 +902,12 @@ def main():
         tedlium_split=args.tedlium_split,
         streaming=not args.no_streaming,
         language=args.language,
+        mode=args.mode,
+        batch_size=args.batch_size,
+        sort_by_length=args.sort_by_length,
         output_csv=args.output_csv,
+        num_shards=args.num_shards,
+        shard_idx=args.shard_idx,
     )
 
 

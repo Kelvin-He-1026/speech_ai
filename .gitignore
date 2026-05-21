@@ -17,3 +17,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+#mlperf
+whisper_mlperf/
