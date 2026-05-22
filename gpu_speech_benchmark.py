@@ -94,6 +94,25 @@ def _check_cuda_and_pin(gpu_idx: int):
     """Validate CUDA visibility and pin this process to one GPU."""
     import torch
     if not torch.cuda.is_available():
+        # Distinguish the two failure modes — they need different fixes and the
+        # generic "install the cuda wheel" advice sends users down the wrong path
+        # when the wheel is fine but the driver/fabric-manager is broken.
+        built_with_cuda = getattr(torch.version, "cuda", None)
+        if built_with_cuda:
+            raise SystemExit(
+                f"CUDA is not available, but torch {torch.__version__} was built "
+                f"with CUDA {built_with_cuda}. The wheel is fine — the driver "
+                f"side isn't.\n"
+                f"  Check:  nvidia-smi   (if this fails, the userspace/kernel "
+                f"driver versions disagree)\n"
+                f"  Check:  systemctl status nvidia-fabricmanager   "
+                f"(must be 'active' on HGX/NVSwitch boxes)\n"
+                f"  Common fix on a fresh apt upgrade: reboot, OR reload the "
+                f"kernel modules:\n"
+                f"    sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && "
+                f"sudo modprobe nvidia nvidia_uvm && "
+                f"sudo systemctl start nvidia-fabricmanager"
+            )
         raise SystemExit(
             "CUDA is not available in this Python.\n"
             "  Likely cause: torch is the CPU-only wheel (e.g. 2.x.x+cpu).\n"
