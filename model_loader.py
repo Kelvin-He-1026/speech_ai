@@ -198,6 +198,6 @@ def load_model(name: str, device: str = "AUTO", dtype=None):
 
 if __name__ == "__main__":
     import sys
-    target = sys.argv[1] if len(sys.argv) > 1 else "whisper-large-v3-int8-ov"
+    target = sys.argv[1] if len(sys.argv) > 1 else "whisper-large-v3"
     m, p = load_model(target)
     print(f"Loaded {target}: {type(m).__name__}, processor {type(p).__name__}")
