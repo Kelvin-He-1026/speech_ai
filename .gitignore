@@ -21,7 +21,7 @@ Thumbs.db
 #mlperf
 whisper_mlperf/model/
 whisper_mlperf/data/dev-all
-whisper_mlperf/data/dev-all-repack
+# whisper_mlperf/data/dev-all-repack
 whisper_mlperf/data/LibriSpeech
 whisper_mlperf/code/
 
