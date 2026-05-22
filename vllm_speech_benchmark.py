@@ -789,18 +789,9 @@ def _run_multi_instance(num_instances: int, samples: list[dict],
     # worker wall and isn't predictable from audio duration anyway.
     shards = _balanced_shards(samples, num_instances)
 
-    # Per-worker log files. Each worker dup2s stdout/stderr here BEFORE
-    # importing vLLM, so engine-core subprocess stderr (where the actual
-    # "Engine core initialization failed" root cause lives) lands here too.
-    stamp = _dt.datetime.now(EAST).strftime("%Y%m%d_%H%M%S")
-    log_dir = OUTPUT_DIR / "logs" / f"run_{stamp}"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_paths = [str(log_dir / f"inst_{i:02d}.log") for i in range(num_instances)]
-
     print(f"[multi] num_instances={num_instances} bindings={bindings}")
     print(f"[multi] shard sizes: {[len(s) for s in shards]} "
           f"(shuffled + round-robin)")
-    print(f"[multi] per-worker logs: {log_dir}/inst_NN.log")
 
     ctx = mp.get_context("spawn")
     result_q = ctx.Queue()
@@ -811,11 +802,15 @@ def _run_multi_instance(num_instances: int, samples: list[dict],
               f"(workers start {spawn_stagger_s:.1f}s apart to avoid "
               f"engine-core init contention)")
     for i in range(num_instances):
+        # log_path=None: worker doesn't dup2 stdout/stderr — its output
+        # goes to the parent process's stdout via mp.spawn pipes. Output
+        # from 24+ workers will interleave; pipe stdout through `tee` or
+        # `>file` at invocation time if you need a clean transcript.
         p = ctx.Process(
             target=_instance_worker,
             args=(i, bindings[i], shards[i], llm_kwargs,
                   mode, batch_size, max_new_tokens, cpu_kvcache_gib, result_q,
-                  log_paths[i]),
+                  None),
         )
         p.start()
         procs.append(p)
@@ -839,13 +834,12 @@ def _run_multi_instance(num_instances: int, samples: list[dict],
 
     if errors:
         for e in errors:
-            lp = e.get("log_path") or "(no log file)"
-            print(f"\n[inst {e['instance_id']}] FAILED — full log: {lp}")
+            print(f"\n[inst {e['instance_id']}] FAILED:")
             print(e["traceback"])
         raise RuntimeError(
-            f"{len(errors)}/{num_instances} instances failed. "
-            f"Inspect per-worker logs in {log_dir}/ for the engine-core "
-            f"root cause (the traceback above is just the Python wrapper)."
+            f"{len(errors)}/{num_instances} instances failed; see Python "
+            f"tracebacks above. For engine-core (subprocess) stderr, re-run "
+            f"with stdout/stderr captured to a file via `2>&1 | tee run.log`."
         )
 
     # MLPerf-comparable wall: longest worker's *processing* time, init excluded.
@@ -919,6 +913,29 @@ def _write_csv(rows: list[SampleRow], summary: Summary, path: Path) -> None:
         w.writerow(rfields)
         for r in rows:
             w.writerow([getattr(r, n) for n in rfields])
+
+
+# One canonical cross-run summary file. Columns are Summary's fields in order —
+# already match the requested schema:
+#   timestamp,model,precision,dataset,mode,batch_size,n_samples,
+#   total_audio_s,total_wall_s,throughput_xrt,throughput_tokens_per_s,
+#   avg_ttft_ms,p50_ttft_ms,p95_ttft_ms,p99_ttft_ms,
+#   avg_tpot_ms,p50_tpot_ms,p95_tpot_ms,p99_tpot_ms
+SUMMARY_CSV_PATH = OUTPUT_DIR / "summary.csv"
+
+
+def _append_summary_row(summary: Summary, path: Path = SUMMARY_CSV_PATH) -> None:
+    """Append one row to the cross-run summary CSV. Writes the header on
+    first use. Every single/batch/offline run adds exactly one line per
+    dataset processed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sfields = [f.name for f in fields(Summary)]
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=sfields)
+        if write_header:
+            w.writeheader()
+        w.writerow({n: getattr(summary, n) for n in sfields})
 
 
 def _print_summary(s: Summary) -> None:
@@ -1056,23 +1073,33 @@ def benchmark(model_arg: str, *, precision: Optional[str], dtype: str,
                              dataset=ds, mode=mode, batch_size=batch_size)
         _print_summary(summary)
 
-        stamp = _dt.datetime.now(EAST).strftime("%Y%m%d_%H%M")
-        mode_tag = f"batch{batch_size}" if mode == "batch" else mode
-        if num_instances > 1:
-            mode_tag = f"{mode_tag}_inst{num_instances}"
-        # --output-csv overrides the auto path. With multiple datasets it
-        # acts as a base — we append _{ds} so each dataset gets its own file.
-        if output_csv is not None:
-            base = Path(output_csv)
-            if len(datasets) > 1:
-                out_path = base.with_name(f"{base.stem}_{ds}{base.suffix}")
+        # Always append one row to the cross-run summary CSV — the canonical
+        # comparison file. Per-run detail CSV is written only for offline mode
+        # (the full benchmark output) or when --output-csv is explicit.
+        _append_summary_row(summary)
+
+        write_detail = (output_csv is not None) or (mode == "offline")
+        if write_detail:
+            stamp = _dt.datetime.now(EAST).strftime("%Y%m%d_%H%M")
+            mode_tag = f"batch{batch_size}" if mode == "batch" else mode
+            if num_instances > 1:
+                mode_tag = f"{mode_tag}_inst{num_instances}"
+            if output_csv is not None:
+                base = Path(output_csv)
+                if len(datasets) > 1:
+                    out_path = base.with_name(f"{base.stem}_{ds}{base.suffix}")
+                else:
+                    out_path = base
             else:
-                out_path = base
+                out_path = OUTPUT_DIR / (
+                    f"{model_slug}_{precision}_{ds}_{mode_tag}_{stamp}.csv"
+                )
+            _write_csv(rows, summary, out_path)
+            print(f"wrote {out_path}")
+            written.append(out_path)
         else:
-            out_path = OUTPUT_DIR / f"{model_slug}_{precision}_{ds}_{mode_tag}_{stamp}.csv"
-        _write_csv(rows, summary, out_path)
-        print(f"wrote {out_path}")
-        written.append(out_path)
+            print(f"summary row appended to {SUMMARY_CSV_PATH} "
+                  f"(per-run detail CSV skipped for mode={mode})")
     return written
 
 
