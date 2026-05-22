@@ -25,3 +25,36 @@ auto-round>=0.5
 
 # Evaluation
 jiwer>=4.0
+
+# ---------------------------------------------------------------------------
+# vllm_speech_benchmark.py (CPU vLLM path) — extras
+# ---------------------------------------------------------------------------
+
+# Per-worker NUMA memory binding (mirrors whisper_mlperf SUT.py:36+120). Without
+# this, model weights and KV cache pages land cross-NUMA via Linux first-touch,
+# costing ~10-20% throughput on a 2-socket box.
+py-libnuma>=1.2
+
+# vLLM is intentionally NOT pinned here. `pip install vllm` ships the CUDA
+# wheel by default, which fails on CPU-only hosts and uses the wrong kernel
+# path on hybrid hosts. For the CPU INT8/INT4 GEMM kernels this benchmark
+# exercises, build from source with VLLM_TARGET_DEVICE=cpu.
+#
+# Plain pip (CPU-only host):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   git clone https://github.com/vllm-project/vllm /path/to/vllm
+#   cd /path/to/vllm && pip install -r requirements/cpu.txt
+#   VLLM_TARGET_DEVICE=cpu pip install -e . --no-build-isolation
+#
+# uv pip (if you prefer):
+#   uv venv --python 3.12 && source .venv/bin/activate
+#   uv pip install -e . --torch-backend=cpu   # --torch-backend is a uv flag
+#
+# Verified working: vllm-0.21.1rc1.dev123+g117afeea4.cpu on a CPU-only box.
+# Authoritative docs: https://docs.vllm.ai/en/latest/getting_started/installation/cpu/
+
+# System packages (not pip-installable). The benchmark auto-preloads tcmalloc
+# inside each worker; without it vLLM's CPU runtime prints "libtcmalloc is not
+# found in LD_PRELOAD" and loses ~15-25% throughput. Install once per host:
+#   Ubuntu/Debian:   sudo apt install libtcmalloc-minimal4 libnuma1 numactl
+#   RHEL/CentOS:     sudo dnf install gperftools-libs numactl-libs numactl
