@@ -148,6 +148,7 @@ class Summary:
     precision: str
     dataset: str
     mode: str
+    num_instances: int
     batch_size: int
     n_samples: int
     total_audio_s: float
@@ -867,10 +868,12 @@ def _run_multi_instance(num_instances: int, samples: list[dict],
 
 def _summarize(rows: list[SampleRow], wall_s: float, *,
                model: str, precision: str, dataset: str,
-               mode: str, batch_size: int) -> Summary:
+               mode: str, batch_size: int,
+               num_instances: int) -> Summary:
     ts = _dt.datetime.now().isoformat(timespec="seconds")
     if not rows:
-        return Summary(ts, model, precision, dataset, mode, batch_size, 0,
+        return Summary(ts, model, precision, dataset, mode,
+                       num_instances, batch_size, 0,
                        0.0, wall_s, 0.0, 0.0,
                        0.0, 0.0, 0.0, 0.0,
                        0.0, 0.0, 0.0, 0.0)
@@ -879,10 +882,16 @@ def _summarize(rows: list[SampleRow], wall_s: float, *,
     ttfts = np.array([r.ttft_ms for r in rows])
     tpot_vals = [r.tpot_ms for r in rows if r.n_output_tokens > 1]
     tpots = np.array(tpot_vals) if tpot_vals else np.array([0.0])
+    # Record the EFFECTIVE per-engine in-flight cap, not the CLI --batch-size:
+    #   single  → 1                (CLI batch_size is ignored at runtime)
+    #   batch   → batch_size       (the knob)
+    #   offline → len(rows)        (vLLM caps internally at max_num_seqs)
+    # System-wide concurrency = num_instances × effective_batch.
+    effective_batch = _max_concurrent_for_mode(mode, batch_size, len(rows))
     return Summary(
         timestamp=ts,
         model=model, precision=precision, dataset=dataset,
-        mode=mode, batch_size=batch_size,
+        mode=mode, num_instances=num_instances, batch_size=effective_batch,
         n_samples=len(rows),
         total_audio_s=audio,
         total_wall_s=wall_s,
@@ -1070,7 +1079,8 @@ def benchmark(model_arg: str, *, precision: Optional[str], dtype: str,
             )
 
         summary = _summarize(rows, wall, model=model_slug, precision=precision,
-                             dataset=ds, mode=mode, batch_size=batch_size)
+                             dataset=ds, mode=mode, batch_size=batch_size,
+                             num_instances=num_instances)
         _print_summary(summary)
 
         # Always append one row to the cross-run summary CSV — the canonical
